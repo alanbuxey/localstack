@@ -1,6 +1,7 @@
 package cloud.localstack;
 
 import cloud.localstack.lambda.DDBEventParser;
+import cloud.localstack.lambda.S3EventParser;
 import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.RequestStreamHandler;
@@ -8,22 +9,31 @@ import com.amazonaws.services.lambda.runtime.events.KinesisEvent;
 import com.amazonaws.services.lambda.runtime.events.KinesisEvent.KinesisEventRecord;
 import com.amazonaws.services.lambda.runtime.events.KinesisEvent.Record;
 import com.amazonaws.services.lambda.runtime.events.SNSEvent;
+import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import com.amazonaws.util.StringInputStream;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.lang3.StringUtils;
 import org.joda.time.DateTime;
-import sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl;
 
 import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.*;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Date;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -44,6 +54,8 @@ public class LambdaExecutor {
 
 		String fileContent = readFile(args[1]);
 		ObjectMapper reader = new ObjectMapper();
+		reader.configure(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES, true);
+		reader.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 		Map<String,Object> map = reader.readerFor(Map.class).readValue(fileContent);
 
 		List<Map<String,Object>> records = (List<Map<String, Object>>) get(map, "Records");
@@ -56,7 +68,7 @@ public class LambdaExecutor {
 				inputObject = deserialisedInput.get();
 			}
 		} else {
-			if (records.stream().anyMatch(record -> record.containsKey("Kinesis"))) {
+			if (records.stream().anyMatch(record -> record.containsKey("kinesis") || record.containsKey("Kinesis"))) {
 				KinesisEvent kinesisEvent = new KinesisEvent();
 				inputObject = kinesisEvent;
 				kinesisEvent.setRecords(new LinkedList<>());
@@ -65,9 +77,9 @@ public class LambdaExecutor {
 					kinesisEvent.getRecords().add(r);
 					Record kinesisRecord = new Record();
 					Map<String, Object> kinesis = (Map<String, Object>) get(record, "Kinesis");
-				String dataString = new String(get(kinesis, "Data").toString().getBytes());
-				byte[] decodedData = Base64.getDecoder().decode(dataString);
-				kinesisRecord.setData(ByteBuffer.wrap(decodedData));
+					String dataString = new String(get(kinesis, "Data").toString().getBytes());
+					byte[] decodedData = Base64.getDecoder().decode(dataString);
+					kinesisRecord.setData(ByteBuffer.wrap(decodedData));
 					kinesisRecord.setPartitionKey((String) get(kinesis, "PartitionKey"));
 					kinesisRecord.setApproximateArrivalTimestamp(new Date());
 					r.setKinesis(kinesisRecord);
@@ -88,11 +100,12 @@ public class LambdaExecutor {
 					r.setSns(snsRecord);
 				}
 			} else if (records.stream().filter(record -> record.containsKey("dynamodb")).count() > 0) {
-
 				inputObject = DDBEventParser.parse(records);
-
+			} else if (records.stream().anyMatch(record -> record.containsKey("s3"))) {
+				inputObject = S3EventParser.parse(records);
+			} else if (records.stream().anyMatch(record -> record.containsKey("sqs"))) {
+				inputObject = reader.readValue(fileContent, SQSEvent.class);
 			}
-			//TODO: Support other events (S3, SQS...)
 		}
 
 		Context ctx = new LambdaContext();
@@ -119,10 +132,10 @@ public class LambdaExecutor {
 		try {
 			Optional<Type> handlerInterface = Arrays.stream(handler.getClass().getGenericInterfaces())
 					.filter(genericInterface ->
-						((ParameterizedTypeImpl) genericInterface).getRawType().equals(RequestHandler.class))
+						((ParameterizedType) genericInterface).getRawType().equals(RequestHandler.class))
 					.findFirst();
 			if (handlerInterface.isPresent()) {
-				Class<?> handlerInputType = Class.forName(((ParameterizedTypeImpl) handlerInterface.get())
+				Class<?> handlerInputType = Class.forName(((ParameterizedType) handlerInterface.get())
 						.getActualTypeArguments()[0].getTypeName());
 				inputObject = Optional.of(mapper.readerFor(handlerInputType).readValue(objectString));
 			}

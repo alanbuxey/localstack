@@ -1,47 +1,54 @@
-from __future__ import print_function
-
-import threading
-import traceback
+import io
 import os
+import re
+import pwd
+import grp
 import sys
-import hashlib
+import json
 import uuid
 import time
 import glob
 import base64
+import socket
+import hashlib
+import decimal
+import logging
+import tarfile
+import zipfile
+import binascii
+import calendar
+import tempfile
+import threading
 import subprocess
 import six
 import shutil
-import socket
-import json
-import binascii
-import decimal
-import logging
-import tempfile
 import requests
-import zipfile
+import dns.resolver
+import functools
 from io import BytesIO
 from contextlib import closing
 from datetime import datetime
-from six.moves.urllib.parse import urlparse
-from six.moves import cStringIO as StringIO
 from six import with_metaclass
+from six.moves import cStringIO as StringIO
+from six.moves.urllib.parse import urlparse
 from multiprocessing.dummy import Pool
-from localstack.constants import ENV_DEV
-from localstack.config import DEFAULT_ENCODING
 from localstack import config
+from localstack.config import DEFAULT_ENCODING
+from localstack.constants import ENV_DEV
+from localstack.utils import bootstrap
+from localstack.utils.bootstrap import FuncThread
 
 # arrays for temporary files and resources
 TMP_FILES = []
 TMP_THREADS = []
+TMP_PROCESSES = []
 
 # cache clean variables
 CACHE_CLEAN_TIMEOUT = 60 * 5
 CACHE_MAX_AGE = 60 * 60
-CACHE_FILE_PATTERN = os.path.join(tempfile.gettempdir(), 'cache.*.json')
+CACHE_FILE_PATTERN = os.path.join(tempfile.gettempdir(), '_random_dir_', 'cache.*.json')
 last_cache_clean_time = {'time': 0}
 mutex_clean = threading.Semaphore(1)
-mutex_popen = threading.Semaphore(1)
 
 # misc. constants
 TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S'
@@ -52,11 +59,21 @@ CODEC_HANDLER_UNDERSCORE = 'underscore'
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
 # set up logger
-LOGGER = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
+
+# flag to indicate whether we've received and processed the stop signal
+INFRA_STOPPED = False
+
+# generic cache object
+CACHE = {}
+
+# lock for creating certificate files
+SSL_CERT_LOCK = threading.RLock()
 
 
-# Helper class to convert JSON documents with datetime, decimals, or bytes.
 class CustomEncoder(json.JSONEncoder):
+    """ Helper class to convert JSON documents with datetime, decimals, or bytes. """
+
     def default(self, o):
         if isinstance(o, decimal.Decimal):
             if o % 1 > 0:
@@ -67,80 +84,69 @@ class CustomEncoder(json.JSONEncoder):
             return str(o)
         if isinstance(o, six.binary_type):
             return to_str(o)
-        return super(CustomEncoder, self).default(o)
-
-
-class FuncThread (threading.Thread):
-    def __init__(self, func, params, quiet=False):
-        threading.Thread.__init__(self)
-        self.daemon = True
-        self.params = params
-        self.func = func
-        self.quiet = quiet
-
-    def run(self):
         try:
-            self.func(self.params)
+            return super(CustomEncoder, self).default(o)
         except Exception:
-            if not self.quiet:
-                LOGGER.warning('Thread run method %s(%s) failed: %s' %
-                    (self.func, self.params, traceback.format_exc()))
-
-    def stop(self, quiet=False):
-        if not quiet and not self.quiet:
-            LOGGER.warning('Not implemented: FuncThread.stop(..)')
+            return None
 
 
-class ShellCommandThread (FuncThread):
+class ShellCommandThread(FuncThread):
+    """ Helper class to run a shell command in a background thread. """
+
     def __init__(self, cmd, params={}, outfile=None, env_vars={}, stdin=False,
-            quiet=True, inherit_cwd=False):
+            quiet=True, inherit_cwd=False, inherit_env=True):
         self.cmd = cmd
         self.process = None
         self.outfile = outfile or os.devnull
         self.stdin = stdin
         self.env_vars = env_vars
         self.inherit_cwd = inherit_cwd
+        self.inherit_env = inherit_env
         FuncThread.__init__(self, self.run_cmd, params, quiet=quiet)
 
     def run_cmd(self, params):
 
         def convert_line(line):
-            line = to_str(line)
-            return line.strip() + '\r\n'
+            line = to_str(line or '')
+            return '%s\r\n' % line.strip()
+
+        def filter_line(line):
+            """ Return True if this line should be filtered, i.e., not printed """
+            return '(Press CTRL+C to quit)' in line
 
         try:
-            self.process = run(self.cmd, async=True, stdin=self.stdin, outfile=self.outfile,
-                env_vars=self.env_vars, inherit_cwd=self.inherit_cwd)
+            self.process = run(self.cmd, asynchronous=True, stdin=self.stdin, outfile=self.outfile,
+                env_vars=self.env_vars, inherit_cwd=self.inherit_cwd, inherit_env=self.inherit_env)
             if self.outfile:
                 if self.outfile == subprocess.PIPE:
                     # get stdout/stderr from child process and write to parent output
-                    for line in iter(self.process.stdout.readline, ''):
-                        if not (line and line.strip()):
-                            time.sleep(0.1)
-                            if self.is_killed():
+                    streams = ((self.process.stdout, sys.stdout), (self.process.stderr, sys.stderr))
+                    for instream, outstream in streams:
+                        for line in iter(instream.readline, None):
+                            # `line` should contain a newline at the end as we're iterating,
+                            # hence we can safely break the loop if `line` is None or empty string
+                            if line in [None, '', b'']:
                                 break
-                        line = convert_line(line)
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                    for line in iter(self.process.stderr.readline, ''):
-                        if not (line and line.strip()):
-                            time.sleep(0.1)
-                            if self.is_killed():
+                            if not (line and line.strip()) and self.is_killed():
                                 break
-                        line = convert_line(line)
-                        sys.stderr.write(line)
-                        sys.stderr.flush()
+                            line = convert_line(line)
+                            if filter_line(line):
+                                continue
+                            outstream.write(line)
+                            outstream.flush()
                 self.process.wait()
             else:
                 self.process.communicate()
         except Exception as e:
             if self.process and not self.quiet:
-                LOGGER.warning('Shell command error "%s": %s' % (e, self.cmd))
+                LOG.warning('Shell command error "%s": %s' % (e, self.cmd))
         if self.process and not self.quiet and self.process.returncode != 0:
-            LOGGER.warning('Shell command exit code "%s": %s' % (self.process.returncode, self.cmd))
+            LOG.warning('Shell command exit code "%s": %s' % (self.process.returncode, self.cmd))
 
     def is_killed(self):
         if not self.process:
+            return True
+        if INFRA_STOPPED:
             return True
         # Note: Do NOT import "psutil" at the root scope, as this leads
         # to problems when importing this file from our test Lambdas in Docker
@@ -155,7 +161,7 @@ class ShellCommandThread (FuncThread):
         import psutil
 
         if not self.process:
-            LOGGER.warning("No process found for command '%s'" % self.cmd)
+            LOG.warning("No process found for command '%s'" % self.cmd)
             return
 
         parent_pid = self.process.pid
@@ -167,11 +173,11 @@ class ShellCommandThread (FuncThread):
             self.process = None
         except Exception:
             if not quiet:
-                LOGGER.warning('Unable to kill process with pid %s' % parent_pid)
+                LOG.warning('Unable to kill process with pid %s' % parent_pid)
 
 
-# Generic JSON serializable object for simplified subclassing
 class JsonObject(object):
+    """ Generic JSON serializable object for simplified subclassing """
 
     def to_json(self, indent=None):
         return json.dumps(self,
@@ -211,17 +217,118 @@ class JsonObject(object):
         return self.__str__()
 
 
+class CaptureOutput(object):
+    """ A context manager that captures stdout/stderr of the current thread. Use it as follows:
+
+        with CaptureOutput() as c:
+            ...
+        print(c.stdout(), c.stderr())
+    """
+
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    orig___stdout = sys.__stdout__
+    orig___stderr = sys.__stderr__
+    CONTEXTS_BY_THREAD = {}
+
+    class LogStreamIO(io.StringIO):
+        def write(self, s):
+            if isinstance(s, str) and hasattr(s, 'decode'):
+                s = s.decode('unicode-escape')
+            return super(CaptureOutput.LogStreamIO, self).write(s)
+
+    def __init__(self):
+        self._stdout = self.LogStreamIO()
+        self._stderr = self.LogStreamIO()
+
+    def __enter__(self):
+        # Note: import werkzeug here (not at top of file) to allow dependency pruning
+        from werkzeug.local import LocalProxy
+
+        ident = self._ident()
+        if ident not in self.CONTEXTS_BY_THREAD:
+            self.CONTEXTS_BY_THREAD[ident] = self
+            self._set(LocalProxy(self._proxy(sys.stdout, 'stdout')),
+                      LocalProxy(self._proxy(sys.stderr, 'stderr')),
+                      LocalProxy(self._proxy(sys.__stdout__, 'stdout')),
+                      LocalProxy(self._proxy(sys.__stderr__, 'stderr')))
+        return self
+
+    def __exit__(self, type, value, traceback):
+        ident = self._ident()
+        removed = self.CONTEXTS_BY_THREAD.pop(ident, None)
+        if not self.CONTEXTS_BY_THREAD:
+            # reset pointers
+            self._set(self.orig_stdout, self.orig_stderr, self.orig___stdout, self.orig___stderr)
+        # get value from streams
+        removed._stdout.flush()
+        removed._stderr.flush()
+        out = removed._stdout.getvalue()
+        err = removed._stderr.getvalue()
+        # close handles
+        removed._stdout.close()
+        removed._stderr.close()
+        removed._stdout = out
+        removed._stderr = err
+
+    def _set(self, out, err, __out, __err):
+        sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__ = (out, err, __out, __err)
+
+    def _proxy(self, original_stream, type):
+        def proxy():
+            ident = self._ident()
+            ctx = self.CONTEXTS_BY_THREAD.get(ident)
+            if ctx:
+                return ctx._stdout if type == 'stdout' else ctx._stderr
+            return original_stream
+
+        return proxy
+
+    def _ident(self):
+        return threading.currentThread().ident
+
+    def stdout(self):
+        return self._stdout.getvalue() if hasattr(self._stdout, 'getvalue') else self._stdout
+
+    def stderr(self):
+        return self._stderr.getvalue() if hasattr(self._stderr, 'getvalue') else self._stderr
+
+
 # ----------------
 # UTILITY METHODS
 # ----------------
 
+def synchronized(lock=None):
+    """
+    Synchronization decorator as described in
+    http://blog.dscpl.com.au/2014/01/the-missing-synchronized-decorator.html.
+    """
+    def _decorator(wrapped):
+        @functools.wraps(wrapped)
+        def _wrapper(*args, **kwargs):
+            with lock:
+                return wrapped(*args, **kwargs)
+        return _wrapper
+    return _decorator
 
-def is_string(s, include_unicode=True):
+
+def is_string(s, include_unicode=True, exclude_binary=False):
+    if isinstance(s, six.binary_type) and exclude_binary:
+        return False
     if isinstance(s, str):
         return True
     if include_unicode and isinstance(s, six.text_type):
         return True
     return False
+
+
+def is_string_or_bytes(s):
+    return is_string(s) or isinstance(s, six.string_types) or isinstance(s, bytes)
+
+
+def is_base64(s):
+    regex = r'^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$'
+    return is_string(s) and re.match(regex, s)
 
 
 def md5(string):
@@ -230,36 +337,87 @@ def md5(string):
     return m.hexdigest()
 
 
-def in_ci():
-    """ Whether or not we are running in a CI environment """
-    for key in ('CI', 'TRAVIS'):
-        if os.environ.get(key, '') not in [False, '', '0', 'false']:
-            return True
-    return False
-
-
 def in_docker():
     return config.in_docker()
 
 
-def is_port_open(port_or_url):
+def has_docker():
+    try:
+        run('docker ps')
+        return True
+    except Exception:
+        return False
+
+
+def get_docker_container_names():
+    return bootstrap.get_docker_container_names()
+
+
+def is_port_open(port_or_url, http_path=None, expect_success=True, protocols=['tcp']):
     port = port_or_url
-    host = '127.0.0.1'
+    host = 'localhost'
+    protocol = 'http'
+    protocols = protocols if isinstance(protocols, list) else [protocols]
     if isinstance(port, six.string_types):
         url = urlparse(port_or_url)
         port = url.port
         host = url.hostname
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-        sock.settimeout(1)
-        result = sock.connect_ex((host, port))
-        return result == 0
+        protocol = url.scheme
+    nw_protocols = []
+    nw_protocols += ([socket.SOCK_STREAM] if 'tcp' in protocols else [])
+    nw_protocols += ([socket.SOCK_DGRAM] if 'udp' in protocols else [])
+    for nw_protocol in nw_protocols:
+        with closing(socket.socket(socket.AF_INET, nw_protocol)) as sock:
+            sock.settimeout(1)
+            if nw_protocol == socket.SOCK_DGRAM:
+                try:
+                    if port == 53:
+                        dnshost = '127.0.0.1' if host == 'localhost' else host
+                        resolver = dns.resolver.Resolver()
+                        resolver.nameservers = [dnshost]
+                        resolver.timeout = 1
+                        resolver.lifetime = 1
+                        answers = resolver.query('google.com', 'A')
+                        assert len(answers) > 0
+                    else:
+                        sock.sendto(bytes(), (host, port))
+                        sock.recvfrom(1024)
+                except Exception:
+                    return False
+            elif nw_protocol == socket.SOCK_STREAM:
+                result = sock.connect_ex((host, port))
+                if result != 0:
+                    return False
+    if 'tcp' not in protocols or not http_path:
+        return True
+    url = '%s://%s:%s%s' % (protocol, host, port, http_path)
+    try:
+        response = safe_requests.get(url)
+        return not expect_success or response.status_code < 400
+    except Exception:
+        return False
 
 
-def wait_for_port_open(port, retries=10, sleep_time=0.5):
-    for i in range(0, retries):
-        if is_port_open(port):
-            break
-        time.sleep(sleep_time)
+def wait_for_port_open(port, http_path=None, expect_success=True, retries=10, sleep_time=0.5):
+    """ Ping the given network port until it becomes available (for a given number of retries).
+        If 'http_path' is set, make a GET request to this path and assert a non-error response. """
+    def check():
+        if not is_port_open(port, http_path=http_path, expect_success=expect_success):
+            raise Exception()
+
+    return retry(check, sleep=sleep_time, retries=retries)
+
+
+def get_free_tcp_port():
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.bind(('', 0))
+    addr, port = tcp.getsockname()
+    tcp.close()
+    return port
+
+
+def get_service_protocol():
+    return 'https' if config.USE_SSL else 'http'
 
 
 def timestamp(time=None, format=TIMESTAMP_FORMAT):
@@ -297,14 +455,51 @@ def merge_recursive(source, destination):
             merge_recursive(value, node)
         else:
             if not isinstance(destination, dict):
-                LOGGER.warning('Destination for merging %s=%s is not dict: %s' %
+                LOG.warning('Destination for merging %s=%s is not dict: %s' %
                     (key, value, destination))
             destination[key] = value
     return destination
 
 
+def merge_dicts(*dicts, **kwargs):
+    """ Merge all dicts in `*dicts` into a single dict, and return the result. If any of the entries
+        in `*dicts` is None, and `default` is specified as keyword argument, then return `default`. """
+    result = {}
+    for d in dicts:
+        if d is None and 'default' in kwargs:
+            return kwargs['default']
+        if d:
+            result.update(d)
+    return result
+
+
+def recurse_object(obj, func, path=''):
+    """ Recursively apply `func` to `obj` (may be a list, dict, or other object). """
+    obj = func(obj, path=path)
+    if isinstance(obj, list):
+        for i in range(len(obj)):
+            tmp_path = '%s[%s]' % (path or '.', i)
+            obj[i] = recurse_object(obj[i], func, tmp_path)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            tmp_path = '%s%s' % ((path + '.') if path else '', k)
+            obj[k] = recurse_object(v, func, tmp_path)
+    return obj
+
+
 def base64_to_hex(b64_string):
     return binascii.hexlify(base64.b64decode(b64_string))
+
+
+def obj_to_xml(obj):
+    """ Return an XML representation of the given object (dict, list, or primitive).
+        Does NOT add a common root element if the given obj is a list.
+        Does NOT work for nested dict structures. """
+    if isinstance(obj, list):
+        return ''.join([obj_to_xml(o) for o in obj])
+    if isinstance(obj, dict):
+        return ''.join(['<{k}>{v}</{k}>'.format(k=k, v=obj_to_xml(v)) for (k, v) in obj.items()])
+    return str(obj)
 
 
 def now_utc():
@@ -316,12 +511,17 @@ def now():
 
 
 def mktime(timestamp):
-    return time.mktime(timestamp.timetuple())
+    return calendar.timegm(timestamp.timetuple())
 
 
 def mkdir(folder):
     if not os.path.exists(folder):
-        os.makedirs(folder)
+        try:
+            os.makedirs(folder)
+        except OSError as err:
+            # Ignore rare 'File exists' race conditions.
+            if err.errno != 17:
+                raise
 
 
 def ensure_readable(file_path, default_perms=None):
@@ -331,14 +531,25 @@ def ensure_readable(file_path, default_perms=None):
         with open(file_path, 'rb'):
             pass
     except Exception:
-        LOGGER.info('Updating permissions as file is currently not readable: %s' % file_path)
+        LOG.info('Updating permissions as file is currently not readable: %s' % file_path)
         os.chmod(file_path, default_perms)
 
 
-def chmod_r(path, mode):
-    """Recursive chmod"""
-    os.chmod(path, mode)
+def chown_r(path, user):
+    """ Recursive chown """
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(user).gr_gid
+    os.chown(path, uid, gid)
+    for root, dirs, files in os.walk(path):
+        for dirname in dirs:
+            os.chown(os.path.join(root, dirname), uid, gid)
+        for filename in files:
+            os.chown(os.path.join(root, filename), uid, gid)
 
+
+def chmod_r(path, mode):
+    """ Recursive chmod """
+    os.chmod(path, mode)
     for root, dirnames, filenames in os.walk(path):
         for dirname in dirnames:
             os.chmod(os.path.join(root, dirname), mode)
@@ -347,10 +558,22 @@ def chmod_r(path, mode):
 
 
 def rm_rf(path):
-    """Recursively removes file/directory"""
+    """
+    Recursively removes a file or directory
+    """
+    if not path or not os.path.exists(path):
+        return
+    # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
+    if is_alpine():
+        try:
+            return run('rm -rf "%s"' % path)
+        except Exception:
+            pass
     # Make sure all files are writeable and dirs executable to remove
     chmod_r(path, 0o777)
-    if os.path.isfile(path):
+    # check if the file is either a normal file, or, e.g., a fifo
+    exists_but_non_dir = os.path.exists(path) and not os.path.isdir(path)
+    if os.path.isfile(path) or exists_but_non_dir:
         os.remove(path)
     else:
         shutil.rmtree(path)
@@ -370,25 +593,89 @@ def download(url, path, verify_ssl=True):
     # enable parallel file downloads during installation!
     s = requests.Session()
     r = s.get(url, stream=True, verify=verify_ssl)
+    # check status code before attempting to read body
+    if r.status_code >= 400:
+        raise Exception('Failed to download %s, response code %s' % (url, r.status_code))
+
     total = 0
     try:
         if not os.path.exists(os.path.dirname(path)):
             os.makedirs(os.path.dirname(path))
-        LOGGER.debug('Starting download from %s to %s (%s bytes)' % (url, path, r.headers.get('content-length')))
+        LOG.debug('Starting download from %s to %s (%s bytes)' % (url, path, r.headers.get('content-length')))
         with open(path, 'wb') as f:
             for chunk in r.iter_content(DOWNLOAD_CHUNK_SIZE):
                 total += len(chunk)
                 if chunk:  # filter out keep-alive new chunks
                     f.write(chunk)
-                    LOGGER.debug('Writing %s bytes (total %s) to %s' % (len(chunk), total, path))
+                    LOG.debug('Writing %s bytes (total %s) to %s' % (len(chunk), total, path))
                 else:
-                    LOGGER.debug('Empty chunk %s (total %s) from %s' % (chunk, total, url))
+                    LOG.debug('Empty chunk %s (total %s) from %s' % (chunk, total, url))
             f.flush()
             os.fsync(f)
+        if os.path.getsize(path) == 0:
+            LOG.warning('Zero bytes downloaded from %s, retrying' % url)
+            download(url, path, verify_ssl)
+            return
+        LOG.debug('Done downloading %s, response code %s, total bytes %d' % (url, r.status_code, total))
     finally:
-        LOGGER.debug('Done downloading %s, response code %s' % (url, r.status_code))
+        LOG.debug('Cleaning up file handles for download of %s' % url)
         r.close()
         s.close()
+
+
+def parse_chunked_data(data):
+    """ Parse the body of an HTTP message transmitted with chunked transfer encoding. """
+    data = (data or '').strip()
+    chunks = []
+    while data:
+        length = re.match(r'^([0-9a-zA-Z]+)\r\n.*', data)
+        if not length:
+            break
+        length = length.group(1).lower()
+        length = int(length, 16)
+        data = data.partition('\r\n')[2]
+        chunks.append(data[:length])
+        data = data[length:].strip()
+    return ''.join(chunks)
+
+
+def is_number(s):
+    try:
+        float(s)  # for int, long and float
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def is_mac_os():
+    return bootstrap.is_mac_os()
+
+
+def is_linux():
+    return bootstrap.is_linux()
+
+
+def is_alpine():
+    try:
+        if '_is_alpine_' not in CACHE:
+            CACHE['_is_alpine_'] = False
+            if not os.path.exists('/etc/issue'):
+                return False
+            out = to_str(subprocess.check_output('cat /etc/issue', shell=True))
+            CACHE['_is_alpine_'] = 'Alpine' in out
+    except subprocess.CalledProcessError:
+        return False
+    return CACHE['_is_alpine_']
+
+
+def get_arch():
+    if is_mac_os():
+        return 'osx'
+    if is_alpine():
+        return 'alpine'
+    if is_linux():
+        return 'linux'
+    raise Exception('Unable to determine system architecture')
 
 
 def short_uid():
@@ -457,8 +744,14 @@ def cleanup(files=True, env=ENV_DEV, quiet=True):
 def cleanup_threads_and_processes(quiet=True):
     for t in TMP_THREADS:
         t.stop(quiet=quiet)
-    # clear list
+    for p in TMP_PROCESSES:
+        try:
+            p.terminate()
+        except Exception as e:
+            print(e)
+    # clear lists
     clear_list(TMP_THREADS)
+    clear_list(TMP_PROCESSES)
 
 
 def clear_list(l):
@@ -469,13 +762,25 @@ def clear_list(l):
 def cleanup_tmp_files():
     for tmp in TMP_FILES:
         try:
-            if os.path.isdir(tmp):
-                run('rm -rf "%s"' % tmp)
-            else:
-                os.remove(tmp)
+            rm_rf(tmp)
         except Exception:
             pass  # file likely doesn't exist, or permission denied
     del TMP_FILES[:]
+
+
+def new_tmp_file():
+    """ Return a path to a new temporary file. """
+    tmp_file, tmp_path = tempfile.mkstemp()
+    os.close(tmp_file)
+    TMP_FILES.append(tmp_path)
+    return tmp_path
+
+
+def new_tmp_dir():
+    folder = new_tmp_file()
+    rm_rf(folder)
+    mkdir(folder)
+    return folder
 
 
 def is_ip_address(addr):
@@ -491,17 +796,23 @@ def is_zip_file(content):
     return zipfile.is_zipfile(stream)
 
 
-def unzip(path, target_dir):
+def unzip(path, target_dir, overwrite=True):
+    if is_alpine():
+        # Running the native command can be an order of magnitude faster in Alpine on Travis-CI
+        flags = '-o' if overwrite else ''
+        return run('cd %s; unzip %s %s' % (target_dir, flags, path))
     try:
         zip_ref = zipfile.ZipFile(path, 'r')
     except Exception as e:
-        LOGGER.warning('Unable to open zip file: %s: %s' % (path, e))
+        LOG.warning('Unable to open zip file: %s: %s' % (path, e))
         raise e
     # Make sure to preserve file permissions in the zip file
     # https://www.burgundywall.com/post/preserving-file-perms-with-python-zipfile-module
-    for file_entry in zip_ref.infolist():
-        _unzip_file_entry(zip_ref, file_entry, target_dir)
-    zip_ref.close()
+    try:
+        for file_entry in zip_ref.infolist():
+            _unzip_file_entry(zip_ref, file_entry, target_dir)
+    finally:
+        zip_ref.close()
 
 
 def _unzip_file_entry(zip_ref, file_entry, target_dir):
@@ -511,24 +822,43 @@ def _unzip_file_entry(zip_ref, file_entry, target_dir):
     zip_ref.extract(file_entry.filename, path=target_dir)
     out_path = os.path.join(target_dir, file_entry.filename)
     perm = file_entry.external_attr >> 16
-    os.chmod(out_path, perm)
+    os.chmod(out_path, perm or 0o777)
 
 
-def is_jar_archive(content):
-    has_class_content = False
-    try:
-        has_class_content = 'class' in content
-    except TypeError:
-        # in Python 3 we need to use byte strings for byte-based file content
-        has_class_content = b'class' in content
-    if not has_class_content:
-        return False
+def untar(path, target_dir):
+    mode = 'r:gz' if path.endswith('gz') else 'r'
+    with tarfile.open(path, mode) as tar:
+        tar.extractall(path=target_dir)
+
+
+def zip_contains_jar_entries(content, jar_path_prefix=None, match_single_jar=True):
     try:
         with tempfile.NamedTemporaryFile() as tf:
             tf.write(content)
             tf.flush()
             with zipfile.ZipFile(tf.name, 'r') as zf:
-                zf.infolist()
+                jar_entries = [e for e in zf.infolist() if e.filename.lower().endswith('.jar')]
+                if match_single_jar and len(jar_entries) == 1 and len(zf.infolist()) == 1:
+                    return True
+                matching_prefix = [e for e in jar_entries if
+                    not jar_path_prefix or e.filename.lower().startswith(jar_path_prefix)]
+                return len(matching_prefix) > 0
+    except Exception:
+        return False
+
+
+def is_jar_archive(content):
+    """ Determine whether `content` contains valid zip bytes representing a JAR archive
+        that contains at least one *.class file and a META-INF/MANIFEST.MF file. """
+    try:
+        with tempfile.NamedTemporaryFile() as tf:
+            tf.write(content)
+            tf.flush()
+            with zipfile.ZipFile(tf.name, 'r') as zf:
+                class_files = [e for e in zf.infolist() if e.filename.endswith('.class')]
+                manifest_file = [e for e in zf.infolist() if e.filename.upper() == 'META-INF/MANIFEST.MF']
+                if not class_files or not manifest_file:
+                    return False
     except Exception:
         return False
     return True
@@ -544,22 +874,29 @@ def cleanup_resources():
     cleanup_threads_and_processes()
 
 
-def generate_ssl_cert(target_file=None, overwrite=False, random=False):
+@synchronized(lock=SSL_CERT_LOCK)
+def generate_ssl_cert(target_file=None, overwrite=False, random=False, return_content=False, serial_number=None):
     # Note: Do NOT import "OpenSSL" at the root scope
     # (Our test Lambdas are importing this file but don't have the module installed)
     from OpenSSL import crypto
 
+    def all_exist(*files):
+        return all([os.path.exists(f) for f in files])
+
+    if target_file and not overwrite and os.path.exists(target_file):
+        key_file_name = '%s.key' % target_file
+        cert_file_name = '%s.crt' % target_file
+        if all_exist(key_file_name, cert_file_name):
+            return target_file, cert_file_name, key_file_name
     if random and target_file:
         if '.' in target_file:
             target_file = target_file.replace('.', '.%s.' % short_uid(), 1)
         else:
             target_file = '%s.%s' % (target_file, short_uid())
-    if target_file and not overwrite and os.path.exists(target_file):
-        return
 
     # create a key pair
     k = crypto.PKey()
-    k.generate_key(crypto.TYPE_RSA, 1024)
+    k.generate_key(crypto.TYPE_RSA, 2048)
 
     # create a self-signed cert
     cert = crypto.X509()
@@ -569,13 +906,24 @@ def generate_ssl_cert(target_file=None, overwrite=False, random=False):
     subj.L = 'Some-Locality'
     subj.O = 'LocalStack Org'  # noqa
     subj.OU = 'Testing'
-    subj.CN = 'LocalStack'
-    cert.set_serial_number(1000)
+    subj.CN = 'localhost'
+    # Note: new requirements for recent OSX versions: https://support.apple.com/en-us/HT210176
+    # More details: https://www.iol.unh.edu/blog/2019/10/10/macos-catalina-and-chrome-trust
+    serial_number = serial_number or 1001
+    cert.set_version(2)
+    cert.set_serial_number(serial_number)
     cert.gmtime_adj_notBefore(0)
-    cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)
+    cert.gmtime_adj_notAfter(2 * 365 * 24 * 60 * 60)
     cert.set_issuer(cert.get_subject())
     cert.set_pubkey(k)
-    cert.sign(k, 'sha1')
+    alt_names = b'DNS:localhost,DNS:test.localhost.atlassian.io,IP:127.0.0.1'
+    cert.add_extensions([
+        crypto.X509Extension(b'subjectAltName', False, alt_names),
+        crypto.X509Extension(b'basicConstraints', True, b'CA:false'),
+        crypto.X509Extension(b'keyUsage', True, b'nonRepudiation,digitalSignature,keyEncipherment'),
+        crypto.X509Extension(b'extendedKeyUsage', True, b'serverAuth')
+    ])
+    cert.sign(k, 'SHA256')
 
     cert_file = StringIO()
     key_file = StringIO()
@@ -585,74 +933,56 @@ def generate_ssl_cert(target_file=None, overwrite=False, random=False):
     key_file_content = key_file.getvalue().strip()
     file_content = '%s\n%s' % (key_file_content, cert_file_content)
     if target_file:
-        save_file(target_file, file_content)
         key_file_name = '%s.key' % target_file
         cert_file_name = '%s.crt' % target_file
-        save_file(key_file_name, key_file_content)
-        save_file(cert_file_name, cert_file_content)
-        TMP_FILES.append(target_file)
-        TMP_FILES.append(key_file_name)
-        TMP_FILES.append(cert_file_name)
-        if random:
+        # check existence to avoid permission denied issues:
+        # https://github.com/localstack/localstack/issues/1607
+        if not all_exist(target_file, key_file_name, cert_file_name):
+            for i in range(2):
+                try:
+                    save_file(target_file, file_content)
+                    save_file(key_file_name, key_file_content)
+                    save_file(cert_file_name, cert_file_content)
+                    break
+                except Exception as e:
+                    if i > 0:
+                        raise
+                    LOG.info('Unable to store certificate file under %s, using tmp file instead: %s' % (target_file, e))
+                    # Fix for https://github.com/localstack/localstack/issues/1743
+                    target_file = '%s.pem' % new_tmp_file()
+                    key_file_name = '%s.key' % target_file
+                    cert_file_name = '%s.crt' % target_file
+            TMP_FILES.append(target_file)
+            TMP_FILES.append(key_file_name)
+            TMP_FILES.append(cert_file_name)
+        if not return_content:
             return target_file, cert_file_name, key_file_name
-        return file_content
     return file_content
 
 
-def run_safe(_python_lambda, print_error=True, **kwargs):
+def run_safe(_python_lambda, print_error=False, **kwargs):
     try:
-        _python_lambda(**kwargs)
+        return _python_lambda(**kwargs)
     except Exception as e:
         if print_error:
-            print('Unable to execute function: %s' % e)
+            LOG.warning('Unable to execute function: %s' % e)
 
 
 def run_cmd_safe(**kwargs):
     return run_safe(run, print_error=False, **kwargs)
 
 
-def run(cmd, cache_duration_secs=0, print_error=True, async=False, stdin=False,
-        stderr=subprocess.STDOUT, outfile=None, env_vars=None, inherit_cwd=False):
-    # don't use subprocess module as it is not thread-safe
-    # http://stackoverflow.com/questions/21194380/is-subprocess-popen-not-thread-safe
-    # import subprocess
-    if six.PY2:
-        import subprocess32 as subprocess
-    else:
-        import subprocess
-
-    env_dict = os.environ.copy()
-    if env_vars:
-        env_dict.update(env_vars)
+def run(cmd, cache_duration_secs=0, **kwargs):
 
     def do_run(cmd):
-        try:
-            cwd = os.getcwd() if inherit_cwd else None
-            if not async:
-                if stdin:
-                    return subprocess.check_output(cmd, shell=True,
-                        stderr=stderr, stdin=subprocess.PIPE, env=env_dict, cwd=cwd)
-                output = subprocess.check_output(cmd, shell=True, stderr=stderr, env=env_dict, cwd=cwd)
-                return output.decode(DEFAULT_ENCODING)
-            # subprocess.Popen is not thread-safe, hence use a mutex here..
-            try:
-                mutex_popen.acquire()
-                stdin_arg = subprocess.PIPE if stdin else None
-                stdout_arg = open(outfile, 'wb') if isinstance(outfile, six.string_types) else outfile
-                process = subprocess.Popen(cmd, shell=True, stdin=stdin_arg, bufsize=-1,
-                    stderr=stderr, stdout=stdout_arg, env=env_dict, cwd=cwd)
-                return process
-            finally:
-                mutex_popen.release()
-        except subprocess.CalledProcessError as e:
-            if print_error:
-                print("ERROR: '%s': %s" % (cmd, e.output))
-            raise e
+        return bootstrap.run(cmd, **kwargs)
 
     if cache_duration_secs <= 0:
         return do_run(cmd)
+
     hash = md5(cmd)
     cache_file = CACHE_FILE_PATTERN.replace('*', hash)
+    mkdir(os.path.dirname(CACHE_FILE_PATTERN))
     if os.path.isfile(cache_file):
         # check file age
         mod_time = os.path.getmtime(cache_file)
@@ -662,7 +992,6 @@ def run(cmd, cache_duration_secs=0, print_error=True, async=False, stdin=False,
             result = f.read()
             f.close()
             return result
-    # print("NO CACHED result available for (timeout %s): %s" % (cache_duration_secs,cmd))
     result = do_run(cmd)
     f = open(cache_file, 'w+')
     f.write(result)
@@ -673,6 +1002,10 @@ def run(cmd, cache_duration_secs=0, print_error=True, async=False, stdin=False,
 
 def clone(item):
     return json.loads(json.dumps(item))
+
+
+def clone_safe(item):
+    return clone(json_safe(item))
 
 
 def remove_non_ascii(text):
@@ -720,6 +1053,14 @@ def make_http_request(url, data=None, headers=None, method='GET'):
     return method(url, headers=headers, data=data, auth=NetrcBypassAuth(), verify=False)
 
 
+class SafeStringIO(io.StringIO):
+    """ Safe StringIO implementation that doesn't fail if str is passed in Python 2. """
+    def write(self, obj):
+        if six.PY2 and isinstance(obj, str):
+            obj = obj.decode('unicode-escape')
+        return super(SafeStringIO, self).write(obj)
+
+
 def clean_cache(file_pattern=CACHE_FILE_PATTERN,
         last_clean_time=last_cache_clean_time, max_age=CACHE_MAX_AGE):
 
@@ -752,3 +1093,14 @@ def parallelize(func, list, size=None):
     pool.close()
     pool.join()
     return result
+
+
+def isoformat_milliseconds(t):
+    try:
+        return t.isoformat(timespec='milliseconds')
+    except TypeError:
+        return t.isoformat()[:-3]
+
+
+# Code that requires util functions from above
+CACHE_FILE_PATTERN = CACHE_FILE_PATTERN.replace('_random_dir_', short_uid())

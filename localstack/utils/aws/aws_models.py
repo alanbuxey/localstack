@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import time
 import json
 import six
@@ -164,14 +162,34 @@ class LambdaFunction(Component):
         self.versions = {}
         self.aliases = {}
         self.envvars = {}
+        self.tags = {}
         self.concurrency = None
         self.runtime = None
         self.handler = None
         self.cwd = None
         self.timeout = None
+        self.last_modified = None
+        self.description = ''
+        self.role = None
+        self.memory_size = None
+        self.code = None
+        self.dead_letter_config = None
+
+    def set_dead_letter_config(self, data):
+        config = data.get('DeadLetterConfig')
+        if not config:
+            return
+        self.dead_letter_config = config
+        target_arn = config.get('TargetArn') or ''
+        if ':sqs:' not in target_arn and ':sns:' not in target_arn:
+            raise Exception('Dead letter queue ARN "%s" requires a valid SQS queue or SNS topic' % target_arn)
 
     def get_version(self, version):
         return self.versions.get(version)
+
+    def max_version(self):
+        versions = [int(key) for key in self.versions.keys() if key != '$LATEST']
+        return versions and max(versions) or 0
 
     def name(self):
         # Example ARN: arn:aws:lambda:aws-region:acct-id:function:helloworld:1
@@ -181,11 +199,13 @@ class LambdaFunction(Component):
         return self.id
 
     def function(self, qualifier=None):
+        return self.versions.get(self.get_qualifier_version(qualifier)).get('Function')
+
+    def get_qualifier_version(self, qualifier=None):
         if not qualifier:
             qualifier = '$LATEST'
-        version = qualifier if qualifier in self.versions else \
+        return qualifier if qualifier in self.versions else \
             self.aliases.get(qualifier).get('FunctionVersion')
-        return self.versions.get(version).get('Function')
 
     def qualifier_exists(self, qualifier):
         return qualifier in self.aliases or qualifier in self.versions
@@ -277,7 +297,7 @@ class EventSource(Component):
         inst = None
         if obj.startswith('arn:aws:kinesis:'):
             inst = KinesisStream(obj)
-        if obj.startswith('arn:aws:lambda:'):
+        elif obj.startswith('arn:aws:lambda:'):
             inst = LambdaFunction(obj)
         elif obj.startswith('arn:aws:dynamodb:'):
             if '/stream/' in obj:
@@ -287,6 +307,8 @@ class EventSource(Component):
                 inst.table = table
             else:
                 inst = DynamoDB(obj)
+        elif obj.startswith('arn:aws:sqs:'):
+            inst = SqsQueue(obj)
         elif type:
             for o in EventSource.filter_type(pool, type):
                 if o.name() == obj:

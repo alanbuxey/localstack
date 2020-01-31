@@ -9,6 +9,7 @@ from localstack.utils.common import json_safe
 TEST_DDB_TABLE_NAME = 'test-ddb-table-1'
 TEST_DDB_TABLE_NAME_2 = 'test-ddb-table-2'
 TEST_DDB_TABLE_NAME_3 = 'test-ddb-table-3'
+TEST_DDB_TABLE_NAME_4 = 'test-ddb-table-4'
 PARTITION_KEY = 'id'
 
 
@@ -17,7 +18,7 @@ class DynamoDBIntegrationTest (unittest.TestCase):
     def test_non_ascii_chars(self):
         dynamodb = aws_stack.connect_to_resource('dynamodb')
 
-        testutil.create_dynamodb_table(TEST_DDB_TABLE_NAME, partition_key=PARTITION_KEY)
+        aws_stack.create_dynamodb_table(TEST_DDB_TABLE_NAME, partition_key=PARTITION_KEY)
         table = dynamodb.Table(TEST_DDB_TABLE_NAME)
 
         # write some items containing non-ASCII characters
@@ -36,11 +37,14 @@ class DynamoDBIntegrationTest (unittest.TestCase):
             item2 = json_safe(items[item_id])
             assert item1 == item2
 
+        # clean up
+        delete_table(TEST_DDB_TABLE_NAME)
+
     def test_large_data_download(self):
         dynamodb = aws_stack.connect_to_resource('dynamodb')
         dynamodb_client = aws_stack.connect_to_service('dynamodb')
 
-        testutil.create_dynamodb_table(TEST_DDB_TABLE_NAME_2, partition_key=PARTITION_KEY)
+        aws_stack.create_dynamodb_table(TEST_DDB_TABLE_NAME_2, partition_key=PARTITION_KEY)
         table = dynamodb.Table(TEST_DDB_TABLE_NAME_2)
 
         # Create a large amount of items
@@ -60,7 +64,7 @@ class DynamoDBIntegrationTest (unittest.TestCase):
         dynamodb = aws_stack.connect_to_resource('dynamodb')
         dynamodb_client = aws_stack.connect_to_service('dynamodb')
 
-        testutil.create_dynamodb_table(TEST_DDB_TABLE_NAME_3, partition_key=PARTITION_KEY)
+        aws_stack.create_dynamodb_table(TEST_DDB_TABLE_NAME_3, partition_key=PARTITION_KEY)
         table = dynamodb.Table(TEST_DDB_TABLE_NAME_3)
 
         # Insert some items to the table
@@ -132,3 +136,26 @@ class DynamoDBIntegrationTest (unittest.TestCase):
         }))
         assert response.status_code == 200
         assert json.loads(response._content)['Tags'] == []  # Empty list returned
+
+    def test_region_replacement(self):
+        dynamodb = aws_stack.connect_to_resource('dynamodb')
+        aws_stack.create_dynamodb_table(
+            TEST_DDB_TABLE_NAME_4,
+            partition_key=PARTITION_KEY,
+            stream_view_type='NEW_AND_OLD_IMAGES'
+        )
+
+        table = dynamodb.Table(TEST_DDB_TABLE_NAME_4)
+
+        expected_arn_prefix = 'arn:aws:dynamodb:' + aws_stack.get_local_region()
+
+        assert table.table_arn.startswith(expected_arn_prefix)
+        assert table.latest_stream_arn.startswith(expected_arn_prefix)
+
+        # clean up
+        delete_table(TEST_DDB_TABLE_NAME_4)
+
+
+def delete_table(name):
+    dynamodb_client = aws_stack.connect_to_service('dynamodb')
+    dynamodb_client.delete_table(TableName=name)

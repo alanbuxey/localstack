@@ -1,122 +1,160 @@
 import os
 import json
-import time
 import glob
 import tempfile
 import requests
+import shutil
+import zipfile
+import importlib
 from six import iteritems
+from localstack.utils.aws import aws_stack
 from localstack.constants import (LOCALSTACK_ROOT_FOLDER, LOCALSTACK_VENV_FOLDER,
-    LAMBDA_TEST_ROLE, TEST_AWS_ACCOUNT_ID, DEFAULT_REGION)
+    LAMBDA_TEST_ROLE, TEST_AWS_ACCOUNT_ID)
+from localstack.utils.common import TMP_FILES, run, mkdir, to_str, save_file, is_alpine
 from localstack.services.awslambda.lambda_api import (get_handler_file_from_name, LAMBDA_DEFAULT_HANDLER,
     LAMBDA_DEFAULT_RUNTIME, LAMBDA_DEFAULT_STARTING_POSITION, LAMBDA_DEFAULT_TIMEOUT)
-from localstack.utils.common import run, mkdir, to_str, save_file, TMP_FILES
-from localstack.utils.aws import aws_stack
 
 
 ARCHIVE_DIR_PREFIX = 'lambda.archive.'
 
 
-def create_dynamodb_table(table_name, partition_key, env=None, stream_view_type=None):
-    """Utility method to create a DynamoDB table"""
-
-    dynamodb = aws_stack.connect_to_service('dynamodb', env=env, client=True)
-    stream_spec = {'StreamEnabled': False}
-    key_schema = [{
-        'AttributeName': partition_key,
-        'KeyType': 'HASH'
-    }]
-    attr_defs = [{
-        'AttributeName': partition_key,
-        'AttributeType': 'S'
-    }]
-    if stream_view_type is not None:
-        stream_spec = {
-            'StreamEnabled': True,
-            'StreamViewType': stream_view_type
-        }
-    table = None
-    try:
-        table = dynamodb.create_table(TableName=table_name, KeySchema=key_schema,
-            AttributeDefinitions=attr_defs, ProvisionedThroughput={
-                'ReadCapacityUnits': 10, 'WriteCapacityUnits': 10
-            },
-            StreamSpecification=stream_spec
-        )
-    except Exception as e:
-        if 'ResourceInUseException' in str(e):
-            # Table already exists -> return table reference
-            return aws_stack.connect_to_resource('dynamodb', env=env).Table(table_name)
-    time.sleep(2)
-    return table
+def copy_dir(source, target):
+    if is_alpine():
+        # Using the native command can be an order of magnitude faster on Travis-CI
+        return run('cp -r %s %s' % (source, target))
+    shutil.copytree(source, target)
 
 
-def create_lambda_archive(script, stream=None, get_content=False, libs=[], runtime=None):
-    """Utility method to create a Lambda function archive"""
+def rm_dir(dir):
+    if is_alpine():
+        # Using the native command can be an order of magnitude faster on Travis-CI
+        return run('rm -r %s' % (dir))
+    shutil.rmtree(dir)
+
+
+def create_lambda_archive(script, get_content=False, libs=[], runtime=None, file_name=None):
+    """ Utility method to create a Lambda function archive """
+    runtime = runtime or LAMBDA_DEFAULT_RUNTIME
     tmp_dir = tempfile.mkdtemp(prefix=ARCHIVE_DIR_PREFIX)
     TMP_FILES.append(tmp_dir)
-    file_name = get_handler_file_from_name(LAMBDA_DEFAULT_HANDLER, runtime=runtime)
-    script_file = '%s/%s' % (tmp_dir, file_name)
+    file_name = file_name or get_handler_file_from_name(LAMBDA_DEFAULT_HANDLER, runtime=runtime)
+    script_file = os.path.join(tmp_dir, file_name)
+    if os.path.sep in script_file:
+        mkdir(os.path.dirname(script_file))
+        # create __init__.py files along the path to allow Python imports
+        path = file_name.split(os.path.sep)
+        for i in range(1, len(path)):
+            save_file(os.path.join(tmp_dir, *(path[:i] + ['__init__.py'])), '')
     save_file(script_file, script)
     # copy libs
     for lib in libs:
         paths = [lib, '%s.py' % lib]
+        try:
+            module = importlib.import_module(lib)
+            paths.append(module.__file__)
+        except Exception:
+            pass
         target_dir = tmp_dir
-        root_folder = '%s/lib/python*/site-packages' % LOCALSTACK_VENV_FOLDER
+        root_folder = os.path.join(LOCALSTACK_VENV_FOLDER, 'lib/python*/site-packages')
         if lib == 'localstack':
             paths = ['localstack/*.py', 'localstack/utils']
             root_folder = LOCALSTACK_ROOT_FOLDER
-            target_dir = '%s/%s/' % (tmp_dir, lib)
+            target_dir = os.path.join(tmp_dir, lib)
             mkdir(target_dir)
         for path in paths:
-            file_to_copy = '%s/%s' % (root_folder, path)
+            file_to_copy = path if path.startswith('/') else os.path.join(root_folder, path)
             for file_path in glob.glob(file_to_copy):
-                run('cp -r %s %s/' % (file_path, target_dir))
+                name = os.path.join(target_dir, file_path.split(os.path.sep)[-1])
+                if os.path.isdir(file_path):
+                    copy_dir(file_path, name)
+                else:
+                    shutil.copyfile(file_path, name)
 
     # create zip file
-    return create_zip_file(tmp_dir, get_content=True)
+    result = create_zip_file(tmp_dir, get_content=get_content)
+    return result
 
 
-# TODO: Refactor this method and use built-in file operations instead of shell commands
-def create_zip_file(file_path, include='*', get_content=False):
+def delete_lambda_function(name):
+    client = aws_stack.connect_to_service('lambda')
+    client.delete_function(FunctionName=name)
+
+
+def create_zip_file_cli(source_path, base_dir, zip_file):
+    # Using the native zip command can be an order of magnitude faster on Travis-CI
+    source = '*' if source_path == base_dir else os.path.basename(source_path)
+    command = 'cd %s; zip -r %s %s' % (base_dir, zip_file, source)
+    run(command)
+
+
+def create_zip_file_python(source_path, base_dir, zip_file):
+    with zipfile.ZipFile(zip_file, 'w') as zip_file:
+        for root, dirs, files in os.walk(base_dir):
+            for name in files:
+                full_name = os.path.join(root, name)
+                relative = root[len(base_dir):].lstrip(os.path.sep)
+                dest = os.path.join(relative, name)
+                zip_file.write(full_name, dest)
+
+
+def create_zip_file(file_path, get_content=False):
     base_dir = file_path
     if not os.path.isdir(file_path):
         base_dir = tempfile.mkdtemp(prefix=ARCHIVE_DIR_PREFIX)
-        run('cp "%s" "%s"' % (file_path, base_dir))
-        include = os.path.basename(file_path)
+        shutil.copy(file_path, base_dir)
         TMP_FILES.append(base_dir)
     tmp_dir = tempfile.mkdtemp(prefix=ARCHIVE_DIR_PREFIX)
     zip_file_name = 'archive.zip'
-    zip_file = '%s/%s' % (tmp_dir, zip_file_name)
+    full_zip_file = os.path.join(tmp_dir, zip_file_name)
     # create zip file
-    run('cd "%s" && zip -r "%s" %s' % (base_dir, zip_file, include))
+    if is_alpine():
+        create_zip_file_cli(file_path, base_dir, zip_file=full_zip_file)
+    else:
+        create_zip_file_python(file_path, base_dir, zip_file=full_zip_file)
     if not get_content:
         TMP_FILES.append(tmp_dir)
-        return zip_file
+        return full_zip_file
     zip_file_content = None
-    with open(zip_file, 'rb') as file_obj:
+    with open(full_zip_file, 'rb') as file_obj:
         zip_file_content = file_obj.read()
-    run('rm -r "%s"' % tmp_dir)
+    rm_dir(tmp_dir)
     return zip_file_content
 
 
 def create_lambda_function(func_name, zip_file, event_source_arn=None, handler=LAMBDA_DEFAULT_HANDLER,
-        starting_position=LAMBDA_DEFAULT_STARTING_POSITION, runtime=LAMBDA_DEFAULT_RUNTIME,
-        envvars={}):
+        starting_position=None, runtime=None, envvars={}, tags={}, delete=False, layers=None,
+        **kwargs):
     """Utility method to create a new function via the Lambda API"""
 
+    starting_position = starting_position or LAMBDA_DEFAULT_STARTING_POSITION
+    runtime = runtime or LAMBDA_DEFAULT_RUNTIME
     client = aws_stack.connect_to_service('lambda')
+
+    if delete:
+        try:
+            # Delete function if one already exists
+            client.delete_function(FunctionName=func_name)
+        except Exception:
+            pass
+
     # create function
-    client.create_function(
-        FunctionName=func_name,
-        Runtime=runtime,
-        Handler=handler,
-        Role=LAMBDA_TEST_ROLE,
-        Code={
+    additional_kwargs = kwargs
+    kwargs = {
+        'FunctionName': func_name,
+        'Runtime': runtime,
+        'Handler': handler,
+        'Role': LAMBDA_TEST_ROLE,
+        'Code': {
             'ZipFile': zip_file
         },
-        Timeout=LAMBDA_DEFAULT_TIMEOUT,
-        Environment=dict(Variables=envvars)
-    )
+        'Timeout': LAMBDA_DEFAULT_TIMEOUT,
+        'Environment': dict(Variables=envvars),
+        'Tags': tags
+    }
+    kwargs.update(additional_kwargs)
+    if layers:
+        kwargs['Layers'] = layers
+    client.create_function(**kwargs)
     # create event source mapping
     if event_source_arn:
         client.create_event_source_mapping(
@@ -190,23 +228,34 @@ def download_s3_object(s3, bucket, path):
     with tempfile.SpooledTemporaryFile() as tmpfile:
         s3.Bucket(bucket).download_fileobj(path, tmpfile)
         tmpfile.seek(0)
-        return to_str(tmpfile.read())
+        result = tmpfile.read()
+        try:
+            result = to_str(result)
+        except Exception:
+            pass
+        return result
 
 
-def map_all_s3_objects(to_json=True):
+def map_all_s3_objects(to_json=True, buckets=None):
     s3_client = aws_stack.get_s3_client()
     result = {}
-    for bucket in s3_client.buckets.all():
+    buckets = [s3_client.Bucket(b) for b in buckets] if buckets else s3_client.buckets.all()
+    for bucket in buckets:
         for key in bucket.objects.all():
             value = download_s3_object(s3_client, key.bucket_name, key.key)
-            if to_json:
-                value = json.loads(value)
-            result['%s/%s' % (key.bucket_name, key.key)] = value
+            try:
+                if to_json:
+                    value = json.loads(value)
+                key = '%s%s%s' % (key.bucket_name, '' if key.key.startswith('/') else '/', key.key)
+                result[key] = value
+            except Exception:
+                # skip non-JSON or binary objects
+                pass
     return result
 
 
 def get_sample_arn(service, resource):
-    return 'arn:aws:%s:%s:%s:%s' % (service, DEFAULT_REGION, TEST_AWS_ACCOUNT_ID, resource)
+    return 'arn:aws:%s:%s:%s:%s' % (service, aws_stack.get_region(), TEST_AWS_ACCOUNT_ID, resource)
 
 
 def send_describe_dynamodb_ttl_request(table_name):
@@ -231,3 +280,23 @@ def send_dynamodb_request(path, action, request_body):
     }
     url = '{}/{}'.format(os.getenv('TEST_DYNAMODB_URL'), path)
     return requests.put(url, data=request_body, headers=headers, verify=False)
+
+
+def create_sqs_queue(queue_name):
+    """Utility method to create a new queue via SQS API"""
+
+    client = aws_stack.connect_to_service('sqs')
+
+    # create queue
+    queue_url = client.create_queue(QueueName=queue_name)['QueueUrl']
+
+    # get the queue arn
+    queue_arn = client.get_queue_attributes(
+        QueueUrl=queue_url,
+        AttributeNames=['QueueArn'],
+    )['Attributes']['QueueArn']
+
+    return {
+        'QueueUrl': queue_url,
+        'QueueArn': queue_arn,
+    }

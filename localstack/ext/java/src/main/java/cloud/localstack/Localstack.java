@@ -1,16 +1,14 @@
-package cloud.localstack.docker;
+package cloud.localstack;
 
-import cloud.localstack.LocalstackTestRunner;
 import cloud.localstack.ServiceName;
-import cloud.localstack.docker.command.RegexStream;
+import cloud.localstack.docker.*;
+import cloud.localstack.docker.command.*;
+import cloud.localstack.docker.annotation.LocalstackDockerConfiguration;
 import cloud.localstack.docker.exception.LocalstackDockerException;
 import lombok.Getter;
 import lombok.Setter;
 
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -21,18 +19,23 @@ import java.util.stream.Collectors;
  * @author Alan Bevier
  * @author fabianoo
  */
-public class LocalstackDocker {
+public class Localstack {
 
-    private static final Logger LOG = Logger.getLogger(LocalstackDocker.class.getName());
+    private static final Logger LOG = Logger.getLogger(Localstack.class.getName());
 
-    private static final String PORT_CONFIG_FILENAME = "/opt/code/localstack/.venv/lib/python2.7/site-packages/localstack_client/config.py";
+    private static final String PORT_CONFIG_FILENAME = "/opt/code/localstack/" +
+            ".venv/lib/python3.7/site-packages/localstack_client/config.py";
 
     private static final Pattern READY_TOKEN = Pattern.compile("Ready\\.");
 
     //Regular expression used to parse localstack config to determine default ports for services
     private static final Pattern DEFAULT_PORT_PATTERN = Pattern.compile("'(\\w+)'\\Q: '{proto}://{host}:\\E(\\d+)'");
+
     private static final int SERVICE_NAME_GROUP = 1;
+
     private static final int PORT_GROUP = 2;
+
+    public static final String ENV_CONFIG_USE_SSL = "USE_SSL";
 
     private Container localStackContainer;
 
@@ -44,56 +47,65 @@ public class LocalstackDocker {
 
     private static boolean locked = false;
 
-    @Setter
-    private String externalHostName = "localhost";
-    @Setter
-    private boolean pullNewImage = true;
-    @Setter
-    private boolean randomizePorts = false;
-    @Setter
-    private Map<String, String> environmentVariables = new HashMap<>();
+    public static final Localstack INSTANCE = new Localstack();
 
-    @Getter
-    private static LocalstackDocker localstackDocker = new LocalstackDocker();
+    private String externalHostName;
 
-    private LocalstackDocker() {}
+    static {
+        // make sure we avoid any errors related to locally generated SSL certificates
+        TestUtils.disableSslCertChecking();
+    }
 
+    private Localstack() { }
 
-    public void startup() {
+    public void startup(LocalstackDockerConfiguration dockerConfiguration) {
         if (locked) {
             throw new IllegalStateException("A docker instance is starting or already started.");
         }
         locked = true;
+        this.externalHostName = dockerConfiguration.getExternalHostName();
 
         try {
-            localStackContainer = Container.createLocalstackContainer(externalHostName, pullNewImage, randomizePorts, environmentVariables);
+            localStackContainer = Container.createLocalstackContainer(
+                dockerConfiguration.getExternalHostName(),
+                dockerConfiguration.isPullNewImage(),
+                dockerConfiguration.isRandomizePorts(),
+                dockerConfiguration.getImageTag(),
+                dockerConfiguration.getEnvironmentVariables(),
+                dockerConfiguration.getPortMappings()
+            );
             loadServiceToPortMap();
 
-            LOG.info("Waiting for localstack container to be ready...");
+            LOG.info("Waiting for LocalStack container to be ready...");
             localStackContainer.waitForLogToken(READY_TOKEN);
-        } catch (Throwable t) {
-            locked = false;
+        } catch (Exception t) {
+            if (t.toString().contains("port is already allocated") && dockerConfiguration.isIgnoreDockerRunErrors()) {
+                LOG.info("Ignoring port conflict when starting Docker container, due to ignoreDockerRunErrors=true");
+                localStackContainer = Container.getRunningLocalstackContainer();
+                loadServiceToPortMap();
+                return;
+            }
+            this.stop();
             throw new LocalstackDockerException("Could not start the localstack docker container.", t);
         }
     }
 
-
     public void stop() {
-        localStackContainer.stop();
+        if (this.localStackContainer != null) {
+            localStackContainer.stop();
+        }
         locked = false;
     }
-
 
     private void loadServiceToPortMap() {
         String localStackPortConfig = localStackContainer.executeCommand(Arrays.asList("cat", PORT_CONFIG_FILENAME));
 
         Map<String, Integer> ports = new RegexStream(DEFAULT_PORT_PATTERN.matcher(localStackPortConfig)).stream()
-            .collect(Collectors.toMap(match -> match.group(SERVICE_NAME_GROUP),
-                match -> Integer.parseInt(match.group(PORT_GROUP))));
+                .collect(Collectors.toMap(match -> match.group(SERVICE_NAME_GROUP),
+                        match -> Integer.parseInt(match.group(PORT_GROUP))));
 
         serviceToPortMap = Collections.unmodifiableMap(ports);
     }
-
 
     public String getEndpointS3() {
         String s3Endpoint = endpointForService(ServiceName.S3);
@@ -106,7 +118,6 @@ public class LocalstackDocker {
         s3Endpoint = s3Endpoint.replace("localhost", "test.localhost.atlassian.io");
         return s3Endpoint;
     }
-
 
     public String getEndpointKinesis() {
         return endpointForService(ServiceName.KINESIS);
@@ -152,6 +163,10 @@ public class LocalstackDocker {
         return endpointForService(ServiceName.REDSHIFT);
     }
 
+    public String getEndpointCloudWatch() {
+        return endpointForService(ServiceName.CLOUDWATCH);
+    }
+
     public String getEndpointSES() {
         return endpointForService(ServiceName.SES);
     }
@@ -164,14 +179,19 @@ public class LocalstackDocker {
         return endpointForService(ServiceName.CLOUDFORMATION);
     }
 
-    public String getEndpointCloudWatch() {
-        return endpointForService(ServiceName.CLOUDWATCH);
-    }
-
     public String getEndpointSSM() {
         return endpointForService(ServiceName.SSM);
     }
 
+    public String getEndpointSecretsmanager() {
+        return endpointForService(ServiceName.SECRETSMANAGER);
+    }
+
+    public String getEndpointEC2() {
+        return endpointForService(ServiceName.EC2);
+    }
+
+    public String getEndpointStepFunctions() { return endpointForService(ServiceName.STEPFUNCTIONS); }
 
     public String endpointForService(String serviceName) {
         if (serviceToPortMap == null) {
@@ -179,18 +199,18 @@ public class LocalstackDocker {
         }
 
         if (!serviceToPortMap.containsKey(serviceName)) {
-            throw new IllegalArgumentException("Unknown port mapping for service");
+            throw new IllegalArgumentException("Unknown port mapping for service: " + serviceName);
         }
 
         int internalPort = serviceToPortMap.get(serviceName);
         return endpointForPort(internalPort);
     }
 
-
     public String endpointForPort(int port) {
         if (localStackContainer != null) {
             int externalPort = localStackContainer.getExternalPortFor(port);
-            return String.format("http://%s:%s", externalHostName, externalPort);
+            String protocol = useSSL() ? "https" : "http";
+            return String.format("%s://%s:%s", protocol, externalHostName, externalPort);
         }
 
         throw new RuntimeException("Container not started");
@@ -198,5 +218,18 @@ public class LocalstackDocker {
 
     public Container getLocalStackContainer() {
         return localStackContainer;
+    }
+
+    public static boolean useSSL() {
+        return isEnvConfigSet(ENV_CONFIG_USE_SSL);
+    }
+
+    public static boolean isEnvConfigSet(String configName) {
+        String value = System.getenv(configName);
+        return value != null && !Arrays.asList("false", "0", "").contains(value.trim());
+    }
+
+    public static String getDefaultRegion() {
+        return TestUtils.DEFAULT_REGION;
     }
 }

@@ -1,21 +1,20 @@
 import re
+import os
+import json
 import uuid
+import boto3
 import logging
-import xmltodict
-import requests
-from requests.models import Response, Request
+from requests.models import Request, Response
 from six.moves.urllib import parse as urlparse
-from localstack.constants import DEFAULT_REGION, TEST_AWS_ACCOUNT_ID
-from localstack.utils.common import to_str
+from samtranslator.translator.transform import transform as transform_sam
 from localstack.utils.aws import aws_stack
+from localstack.utils.common import to_str, obj_to_xml, safe_requests, run_safe
+from localstack.utils.analytics import event_publisher
 from localstack.utils.cloudformation import template_deployer
 from localstack.services.generic_proxy import ProxyListener
 
 XMLNS_CLOUDFORMATION = 'http://cloudformation.amazonaws.com/doc/2010-05-15/'
-LOGGER = logging.getLogger(__name__)
-
-# maps change set names to change set details
-CHANGE_SETS = {}
+LOG = logging.getLogger(__name__)
 
 
 def error_response(message, code=400, error_type='ValidationError'):
@@ -46,75 +45,9 @@ def make_response(operation_name, content='', code=200):
     return response
 
 
-def stack_exists(stack_name):
-    cloudformation = aws_stack.connect_to_service('cloudformation')
-    stacks = cloudformation.list_stacks()
-    for stack in stacks['StackSummaries']:
-        if stack['StackName'] == stack_name:
-            return True
-    return False
-
-
-def create_stack(req_data):
-    stack_name = req_data.get('StackName')[0]
-    if stack_exists(stack_name):
-        message = 'The resource with the name requested already exists.'
-        return error_response(message, error_type='AlreadyExists')
-    return True
-
-
-def create_change_set(req_data):
-    cs_name = req_data.get('ChangeSetName')[0]
-    change_set_uuid = uuid.uuid4()
-    cs_arn = 'arn:aws:cloudformation:%s:%s:changeSet/%s/%s' % (
-        DEFAULT_REGION, TEST_AWS_ACCOUNT_ID, cs_name, change_set_uuid)
-    CHANGE_SETS[cs_arn] = dict(req_data)
-    response = make_response('CreateChangeSet', '<Id>%s</Id>' % cs_arn)
-    return response
-
-
-def describe_change_set(req_data):
-    cs_arn = req_data.get('ChangeSetName')[0]
-    cs_details = CHANGE_SETS.get(cs_arn)
-    if not cs_details:
-        return error_response('Change Set %s does not exist' % cs_arn, 404, 'ChangeSetNotFound')
-    stack_name = cs_details.get('StackName')[0]
-    response_content = """
-        <StackName>%s</StackName>
-        <ChangeSetId>%s</ChangeSetId>
-        <Status>CREATE_COMPLETE</Status>""" % (stack_name, cs_arn)
-    response = make_response('DescribeChangeSet', response_content)
-    return response
-
-
-def execute_change_set(req_data):
-    cs_arn = req_data.get('ChangeSetName')[0]
-    stack_name = req_data.get('StackName')[0]
-    cs_details = CHANGE_SETS.get(cs_arn)
-    if not cs_details:
-        return error_response('Change Set %s does not exist' % cs_arn, 404, 'ChangeSetNotFound')
-
-    # convert to JSON (might have been YAML, and update_stack/create_stack seem to only work with JSON)
-    template = template_deployer.template_to_json(cs_details.get('TemplateBody')[0])
-
-    # update stack information
-    cloudformation_service = aws_stack.connect_to_service('cloudformation')
-    if stack_exists(stack_name):
-        cloudformation_service.update_stack(StackName=stack_name,
-            TemplateBody=template)
-    else:
-        cloudformation_service.create_stack(StackName=stack_name,
-            TemplateBody=template)
-
-    # now run the actual deployment
-    template_deployer.deploy_template(template, stack_name)
-
-    response = make_response('ExecuteChangeSet')
-    return response
-
-
 def validate_template(req_data):
-    LOGGER.debug(req_data)
+    LOG.debug('Validate CloudFormation template: %s' % req_data)
+    # TODO implement actual validation logic
     response_content = """
         <Capabilities></Capabilities>
         <CapabilitiesReason></CapabilitiesReason>
@@ -123,9 +56,9 @@ def validate_template(req_data):
         <Parameters>
         </Parameters>
     """
-
     try:
-        template_deployer.template_to_json(req_data.get('TemplateBody')[0])
+        template_body = get_template_body(req_data)
+        template_deployer.template_to_json(template_body)
         response = make_response('ValidateTemplate', response_content)
         return response
     except Exception as err:
@@ -133,87 +66,128 @@ def validate_template(req_data):
         return response
 
 
+def transform_template(req_data):
+    template_body = get_template_body(req_data)
+    parsed = template_deployer.parse_template(template_body)
+
+    policy_map = {
+        # SAM Transformer expects this map to be non-empty, but apparently the content doesn't matter (?)
+        'dummy': 'entry'
+        # 'AWSLambdaBasicExecutionRole': 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
+    }
+
+    class MockPolicyLoader(object):
+        def load(self):
+            return policy_map
+
+    if parsed.get('Transform') == 'AWS::Serverless-2016-10-31':
+        # Note: we need to fix boto3 region, otherwise AWS SAM transformer fails
+        region_before = os.environ.get('AWS_DEFAULT_REGION')
+        if boto3.session.Session().region_name is None:
+            os.environ['AWS_DEFAULT_REGION'] = aws_stack.get_region()
+        try:
+            transformed = transform_sam(parsed, {}, MockPolicyLoader())
+            return transformed
+        finally:
+            os.environ.pop('AWS_DEFAULT_REGION', None)
+            if region_before is not None:
+                os.environ['AWS_DEFAULT_REGION'] = region_before
+
+
+def get_template_body(req_data):
+    body = req_data.get('TemplateBody')
+    if body:
+        return body
+    url = req_data.get('TemplateURL')
+    if url:
+        response = run_safe(lambda: safe_requests.get(url, verify=False))
+        # check error codes, and code 301 - fixes https://github.com/localstack/localstack/issues/1884
+        if not response or response.status_code == 301 or response.status_code >= 400:
+            # check if this is an S3 URL, then get the file directly from there
+            if '://localhost' in url or re.match(r'.*s3(\-website)?\.([^\.]+\.)?amazonaws.com.*', url):
+                parsed_path = urlparse.urlparse(url).path.lstrip('/')
+                parts = parsed_path.partition('/')
+                client = aws_stack.connect_to_service('s3')
+                result = client.get_object(Bucket=parts[0], Key=parts[2])
+                body = to_str(result['Body'].read())
+                return body
+            raise Exception('Unable to fetch template body (code %s) from URL %s' % (response.status_code, url))
+        return response.content
+    raise Exception('Unable to get template body from input: %s' % req_data)
+
+
 class ProxyListenerCloudFormation(ProxyListener):
 
     def forward_request(self, method, path, data, headers):
+        if method == 'OPTIONS':
+            return 200
+
         req_data = None
         if method == 'POST' and path == '/':
             req_data = urlparse.parse_qs(to_str(data))
-            action = req_data.get('Action')[0]
+            req_data = dict([(k, v[0]) for k, v in req_data.items()])
+            action = req_data.get('Action')
+            stack_name = req_data.get('StackName')
+
+            if action == 'CreateStack':
+                event_publisher.fire_event(event_publisher.EVENT_CLOUDFORMATION_CREATE_STACK,
+                    payload={'n': event_publisher.get_hash(stack_name)})
+
+            if action == 'DeleteStack':
+                client = aws_stack.connect_to_service('cloudformation')
+                stack_resources = client.list_stack_resources(StackName=stack_name)['StackResourceSummaries']
+                template_deployer.delete_stack(stack_name, stack_resources)
+
+            if action == 'DescribeStackEvents':
+                # fix an issue where moto cannot handle ARNs as stack names (or missing names)
+                run_fix = not stack_name
+                if stack_name:
+                    if stack_name.startswith('arn:aws:cloudformation'):
+                        run_fix = True
+                        stack_name = re.sub(r'arn:aws:cloudformation:[^:]+:[^:]+:stack/([^/]+)(/.+)?',
+                                            r'\1', stack_name)
+                if run_fix:
+                    stack_names = [stack_name] if stack_name else self._list_stack_names()
+                    client = aws_stack.connect_to_service('cloudformation')
+                    events = []
+                    for stack_name in stack_names:
+                        tmp = client.describe_stack_events(StackName=stack_name)['StackEvents'][:1]
+                        events.extend(tmp)
+                    events = [{'member': e} for e in events]
+                    response_content = '<StackEvents>%s</StackEvents>' % obj_to_xml(events)
+                    return make_response('DescribeStackEvents', response_content)
 
         if req_data:
-            if action == 'CreateStack':
-                return create_stack(req_data)
-            if action == 'CreateChangeSet':
-                return create_change_set(req_data)
-            elif action == 'DescribeChangeSet':
-                return describe_change_set(req_data)
-            elif action == 'ExecuteChangeSet':
-                return execute_change_set(req_data)
-            elif action == 'UpdateStack' and req_data.get('TemplateURL'):
-                # Temporary fix until the moto CF backend can handle TemplateURL (currently fails)
-                url = re.sub(r'https?://s3\.amazonaws\.com', aws_stack.get_local_service_url('s3'),
-                    req_data.get('TemplateURL')[0])
-                req_data['TemplateBody'] = requests.get(url).content
-                modified_data = urlparse.urlencode(req_data, doseq=True)
-                return Request(data=modified_data, headers=headers, method=method)
-            elif action == 'ValidateTemplate':
+            if action == 'ValidateTemplate':
                 return validate_template(req_data)
+            if action == 'CreateStack':
+                modified_request = transform_template(req_data)
+                if modified_request:
+                    req_data.pop('TemplateURL', None)
+                    req_data['TemplateBody'] = json.dumps(modified_request)
+                    data = urlparse.urlencode(req_data, doseq=True)
+                    return Request(data=data, headers=headers, method=method)
 
         return True
 
     def return_response(self, method, path, data, headers, response):
-        req_data = None
-        if method == 'POST' and path == '/':
-            req_data = urlparse.parse_qs(to_str(data))
-            action = req_data.get('Action')[0]
+        if response.status_code >= 400:
+            LOG.debug('Error response from CloudFormation (%s) %s %s: %s' %
+                      (response.status_code, method, path, response.content))
 
-        if req_data:
-            if action == 'DescribeStackResources':
-                if response.status_code < 300:
-                    response_dict = xmltodict.parse(response.content)['DescribeStackResourcesResponse']
-                    resources = response_dict['DescribeStackResourcesResult']['StackResources']
-                    if not resources:
-                        # Check if stack exists
-                        stack_name = req_data.get('StackName')[0]
-                        cloudformation_client = aws_stack.connect_to_service('cloudformation')
-                        try:
-                            cloudformation_client.describe_stacks(StackName=stack_name)
-                        except Exception:
-                            return error_response('Stack with id %s does not exist' % stack_name, code=404)
-            if action == 'DescribeStackResource':
-                if response.status_code >= 500:
-                    # fix an error in moto where it fails with 500 if the stack does not exist
-                    return error_response('Stack resource does not exist', code=404)
-            if action == 'ListStackResources':
-                response_dict = xmltodict.parse(response.content, force_list=('member'))['ListStackResourcesResponse']
-                resources = response_dict['ListStackResourcesResult']['StackResourceSummaries']
-                if resources:
-                    sqs_client = aws_stack.connect_to_service('sqs')
-                    content_str = content_str_original = to_str(response.content)
-                    new_response = Response()
-                    new_response.status_code = response.status_code
-                    new_response.headers = response.headers
-                    for resource in resources['member']:
-                        if resource['ResourceType'] == 'AWS::SQS::Queue':
-                            try:
-                                queue_name = resource['PhysicalResourceId']
-                                queue_url = sqs_client.get_queue_url(QueueName=queue_name)['QueueUrl']
-                            except Exception:
-                                stack_name = req_data.get('StackName')[0]
-                                return error_response('Stack with id %s does not exist' % stack_name, code=404)
-                            content_str = re.sub(resource['PhysicalResourceId'], queue_url, content_str)
-                    new_response._content = content_str
-                    if content_str_original != new_response._content:
-                        # if changes have been made, return patched response
-                        new_response.headers['content-length'] = len(new_response._content)
-                        return new_response
-            elif action in ('CreateStack', 'UpdateStack'):
-                if response.status_code >= 400:
-                    return response
-                # run the actual deployment
-                template = template_deployer.template_to_json(req_data.get('TemplateBody')[0])
-                template_deployer.deploy_template(template, req_data.get('StackName')[0])
+        if response._content:
+            aws_stack.fix_account_id_in_arns(response)
+
+    def _list_stack_names(self):
+        client = aws_stack.connect_to_service('cloudformation')
+        stacks = client.list_stacks()['StackSummaries']
+        stack_names = []
+        for stack in stacks:
+            status = stack['StackStatus']
+            if 'FAILED' in status or 'DELETE' in status:
+                continue
+            stack_names.append(stack['StackName'])
+        return stack_names
 
 
 # instantiate listener

@@ -1,14 +1,19 @@
 import json
 import base64
+import logging
 import boto3.dynamodb.types
 from io import BytesIO
 from localstack.utils.aws import aws_stack
 from localstack.utils.common import to_str, to_bytes
 
-TEST_BUCKET_NAME = 'test_bucket'
+TEST_BUCKET_NAME = 'test-bucket'
 KINESIS_STREAM_NAME = 'test_stream_1'
 MSG_BODY_RAISE_ERROR_FLAG = 'raise_error'
 MSG_BODY_MESSAGE_TARGET = 'message_target'
+
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 
 
 # Subclass of boto's TypeDeserializer for DynamoDB
@@ -24,18 +29,41 @@ class TypeDeserializer(boto3.dynamodb.types.TypeDeserializer):
 def handler(event, context):
     """ Generic event forwarder Lambda. """
 
+    # print test messages (to test CloudWatch Logs integration)
+    LOGGER.info('Lambda log message - logging module')
+    print('Lambda log message - print function')
+
+    if MSG_BODY_RAISE_ERROR_FLAG in event:
+        raise Exception('Test exception (this is intentional)')
+
     if 'httpMethod' in event:
         # looks like this is a call from an AWS_PROXY API Gateway
-        body = json.loads(event['body'])
+        try:
+            body = json.loads(event['body'])
+        except Exception:
+            body = {}
         body['pathParameters'] = event.get('pathParameters')
+        body['requestContext'] = event.get('requestContext')
+        body['queryStringParameters'] = event.get('queryStringParameters')
+        body['httpMethod'] = event.get('httpMethod')
+        status_code = body.get('return_status_code', 200)
+        headers = body.get('return_headers', {})
+        body = body.get('return_raw_body') or body
         return {
             'body': body,
-            'statusCode': body.get('return_status_code', 200),
-            'headers': body.get('return_headers', {})
+            'statusCode': status_code,
+            'headers': headers
         }
 
     if 'Records' not in event:
-        return event
+        return {
+            'event': event,
+            'context': {
+                'invoked_function_arn': context.invoked_function_arn,
+                'function_version': context.function_version,
+                'function_name': context.function_name
+            }
+        }
 
     raw_event_messages = []
     for record in event['Records']:
@@ -74,16 +102,30 @@ def deserialize_event(event):
     # Deserialize into Python dictionary and extract the "NewImage" (the new version of the full ddb document)
     ddb = event.get('dynamodb')
     if ddb:
+        result = {
+            '__action_type': event.get('eventName'),
+        }
+
         ddb_deserializer = TypeDeserializer()
-        result = ddb_deserializer.deserialize({'M': ddb.get('NewImage')})
-        result['__action_type'] = event.get('eventName')
+        if ddb.get('OldImage'):
+            result['old_image'] = ddb_deserializer.deserialize({'M': ddb.get('OldImage')})
+        if ddb.get('NewImage'):
+            result['new_image'] = ddb_deserializer.deserialize({'M': ddb.get('NewImage')})
+
         return result
     kinesis = event.get('kinesis')
     if kinesis:
         assert kinesis['sequenceNumber']
         kinesis['data'] = json.loads(to_str(base64.b64decode(kinesis['data'])))
         return kinesis
-    return event.get('Sns')
+    sqs = event.get('sqs')
+    if sqs:
+        result = {'data': event['body']}
+        return result
+    sns = event.get('Sns')
+    if sns:
+        result = {'data': sns['Message']}
+        return result
 
 
 def forward_events(records):

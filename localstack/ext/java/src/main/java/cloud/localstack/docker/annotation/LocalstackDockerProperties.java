@@ -7,7 +7,7 @@ import java.lang.annotation.Target;
 import java.lang.annotation.Inherited;
 
 /**
- * An annotation to provide parameters to the LocalstackDockerTestRunner
+ * An annotation to provide parameters to the main (Docker-based) LocalstackTestRunner
  */
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.TYPE)
@@ -29,7 +29,7 @@ public @interface LocalstackDockerProperties {
     /**
      * Determines if a new image is pulled from the docker repo before the tests are run.
      */
-    boolean pullNewImage() default true;
+    boolean pullNewImage() default false;
 
     /**
      * Determines if the container should expose the default local stack ports (4567-4583) or if it should expose randomized ports
@@ -42,5 +42,20 @@ public @interface LocalstackDockerProperties {
      * up and running.
      */
     String[] services() default {};
-}
 
+    /**
+     * Use a specific image tag for docker container
+     */
+    String imageTag() default "";
+
+    /**
+     * Determines if the singleton container should be used by all test classes
+     */
+    boolean useSingleDockerContainer() default false;
+
+    /**
+     * Determines if errors should be ignored when starting the Docker container.
+     * This can be used to run tests with an existing LocalStack container running on the host.
+     */
+    boolean ignoreDockerRunErrors() default false;
+}
